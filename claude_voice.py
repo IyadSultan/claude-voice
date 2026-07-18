@@ -85,6 +85,7 @@ RUNTIME_DIR = os.path.expanduser("~/.cache/claude-voice")
 SOCK_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
 PID_PATH = os.path.join(RUNTIME_DIR, "daemon.pid")
 LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
+HISTORY_PATH = os.path.join(RUNTIME_DIR, "history.jsonl")
 DAEMON_IDLE_TIMEOUT = 1800            # seconds before idle daemon exits
 DAEMON_SPAWN_WAIT = 15                # max seconds to wait for cold-spawned daemon
 ACTIVE_TTY_STALE = 600                # claim auto-expires after 10 min
@@ -264,6 +265,14 @@ _active_tty: str | None = None
 _active_tty_t: float = 0.0
 _muted_ttys: set[str] = set()
 
+# Last synthesized audio, kept in-process so the daemon can seek within it.
+_play_audio = None
+_play_rate = SAMPLE_RATE
+_play_duration = 0.0
+_play_offset = 0.0
+_play_t0 = 0.0
+_play_paused = False
+
 
 class ProviderError(Exception):
     pass
@@ -295,6 +304,7 @@ def default_config() -> dict:
         "volume": 1.0,
         "theme": "aurora",
         "chime": True,
+        "announce_project": False,
         "use_daemon": True,
         "min_chars": MIN_CHARS,
         "max_chars": MAX_CHARS,
@@ -968,9 +978,43 @@ def mini_bar(current: int, total: int, width: int = 22) -> str:
 
 # ── core speak loop ──
 
+def _log_history(text: str, provider: str, voice: str) -> None:
+    """Append a spoken message to the history log (newest last)."""
+    try:
+        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        with open(HISTORY_PATH, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "text": text,
+                                "provider": provider, "voice": voice}) + "\n")
+        # keep the file from growing forever
+        with open(HISTORY_PATH) as f:
+            lines = f.readlines()
+        if len(lines) > 400:
+            with open(HISTORY_PATH, "w") as f:
+                f.writelines(lines[-200:])
+    except OSError:
+        pass
+
+
+def _read_history() -> list[dict]:
+    """Return spoken-message history, newest first."""
+    entries = []
+    try:
+        with open(HISTORY_PATH) as f:
+            for line in f:
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except OSError:
+        pass
+    entries.reverse()
+    return entries
+
+
 def speak_and_highlight(text: str, provider: str | None = None, voice: str | None = None,
                         show_stats: bool = False, tty_path: str = "/dev/tty") -> dict:
-    global _interrupted
+    global _interrupted, _play_audio, _play_rate, _play_duration, \
+        _play_offset, _play_t0, _play_paused
     cfg = load_config()
     provider = provider or cfg.get("provider", "kokoro")
     voice = voice or current_voice(cfg, provider)
@@ -998,8 +1042,11 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
         return {}
     spinner.stop()
 
+    _log_history(text, provider, voice)
+
     gen_time = time.monotonic() - t0
     audio_duration = len(audio) / rate
+    _play_audio, _play_rate, _play_duration = audio, rate, audio_duration
 
     if timings:
         timings = remap_timings(timings, total_words)
@@ -1017,6 +1064,7 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
 
     ttfa = time.monotonic() - t0
     playback_start = time.monotonic()
+    _play_offset, _play_t0, _play_paused = 0.0, playback_start, False
     sd.play(audio, samplerate=rate)
 
     for word_idx, (start, end) in enumerate(timings):
@@ -1221,7 +1269,8 @@ def _ensure_daemon(wait_seconds: int = DAEMON_SPAWN_WAIT) -> bool:
 
 def _handle_client(conn: socket.socket) -> None:
     """One connection's lifecycle. Runs on a daemon worker thread."""
-    global _daemon_idle_t0, _interrupted, _active_tty, _active_tty_t
+    global _daemon_idle_t0, _interrupted, _active_tty, _active_tty_t, \
+        _play_offset, _play_t0, _play_paused
     try:
         conn.settimeout(2.0)
         buf = b""
@@ -1302,6 +1351,74 @@ def _handle_client(conn: socket.socket) -> None:
             }).encode() + b"\n")
             return
 
+        if op == "seek":
+            # Jump within the last synthesized message (audio only, no karaoke).
+            if _play_audio is None:
+                conn.sendall(json.dumps({"error": "nothing to seek"}).encode() + b"\n")
+                return
+            pos = max(0.0, min(float(req.get("pos", 0.0)), _play_duration))
+            _interrupted = True
+            if sd is not None:
+                sd.stop()
+            with _playback_lock:
+                sd.play(_play_audio[int(pos * _play_rate):], samplerate=_play_rate)
+                _play_offset = pos
+                _play_t0 = time.monotonic()
+            _play_paused = False
+            _daemon_log(f"seek: {pos:.1f}s / {_play_duration:.1f}s")
+            conn.sendall(json.dumps({"ok": True, "pos": pos}).encode() + b"\n")
+            return
+
+        if op == "playpause":
+            if _play_audio is None:
+                conn.sendall(json.dumps({"error": "nothing to play"}).encode() + b"\n")
+                return
+            active = False
+            try:
+                active = bool(sd.get_stream().active)
+            except Exception:
+                pass
+            if active and not _play_paused:
+                # pause: remember where we are, stop the stream
+                pos = min(_play_offset + time.monotonic() - _play_t0, _play_duration)
+                _interrupted = True
+                sd.stop()
+                _play_offset = pos
+                _play_paused = True
+                _daemon_log(f"pause at {pos:.1f}s")
+            else:
+                # resume from the paused position (or restart if finished)
+                pos = _play_offset
+                if pos >= _play_duration - 0.05:
+                    pos = 0.0
+                _interrupted = True
+                sd.stop()
+                with _playback_lock:
+                    sd.play(_play_audio[int(pos * _play_rate):], samplerate=_play_rate)
+                    _play_offset = pos
+                    _play_t0 = time.monotonic()
+                _play_paused = False
+                _daemon_log(f"resume at {pos:.1f}s")
+            conn.sendall(json.dumps({"ok": True, "paused": _play_paused,
+                                     "pos": _play_offset}).encode() + b"\n")
+            return
+
+        if op == "playinfo":
+            playing = False
+            pos = 0.0
+            if _play_audio is not None:
+                if _play_paused:
+                    pos = _play_offset
+                else:
+                    pos = min(_play_offset + time.monotonic() - _play_t0, _play_duration)
+                try:
+                    playing = bool(sd.get_stream().active) and not _play_paused
+                except Exception:
+                    playing = False
+            conn.sendall(json.dumps({"ok": True, "pos": pos, "duration": _play_duration,
+                                     "playing": playing, "paused": _play_paused}).encode() + b"\n")
+            return
+
         # op == "speak"
         # Config may have changed since daemon start (provider switch, speed,
         # theme, on/off) — always re-read it for a speak request.
@@ -1351,7 +1468,18 @@ def _handle_client(conn: socket.socket) -> None:
             try:
                 speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path)
             except Exception as e:
-                _daemon_log(f"playback error: {e}")
+                # The audio output device (e.g. Bluetooth headphones) likely
+                # changed under us — PortAudio holds a stale handle to it.
+                # Reinitialize and retry once before giving up.
+                _daemon_log(f"playback error: {e} — reinitializing audio, retrying")
+                try:
+                    if sd is not None:
+                        sd._terminate()
+                        sd._initialize()
+                    _interrupted = False
+                    speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path)
+                except Exception as e2:
+                    _daemon_log(f"retry failed: {e2}")
     except (json.JSONDecodeError, OSError, ValueError) as e:
         try:
             conn.sendall(json.dumps({"error": str(e)}).encode() + b"\n")
@@ -1746,6 +1874,21 @@ def cmd_theme(args):
     print(f"  {GREEN}✓{RESET} theme → {HIGHLIGHT}{name}{RESET} {BAR_FILL}━━━━━━{RESET}")
 
 
+def cmd_announce(args):
+    cfg = load_config()
+    if not args:
+        state = "on" if cfg.get("announce_project", False) else "off"
+        print(f"  announce project: {CYAN}{state}{RESET}")
+        return
+    val = args[0].lower()
+    if val not in ("on", "off"):
+        print(f"  {RED}✗{RESET} usage: claude-voice announce on|off")
+        return
+    cfg["announce_project"] = val == "on"
+    save_config(cfg)
+    print(f"  {GREEN}✓{RESET} announce project → {CYAN}{val}{RESET}")
+
+
 def cmd_key(args):
     cfg = load_config()
     keyed = [p for p in PROVIDERS if PROVIDERS[p]["needs_key"] or p == "custom"]
@@ -1871,6 +2014,97 @@ def cmd_clip(args=None) -> None:
     }, timeout=3.0)
     if resp is None:
         print(f"  {RED}✗{RESET} daemon unreachable")
+
+
+def cmd_history(args=None) -> None:
+    """List recently spoken messages, newest first."""
+    entries = _read_history()
+    if not entries:
+        print(f"  {DIM}no spoken messages yet{RESET}")
+        return
+    n = 20
+    if args:
+        try:
+            n = max(1, int(args[0]))
+        except ValueError:
+            pass
+    for i, e in enumerate(entries[:n], 1):
+        when = time.strftime("%H:%M", time.localtime(e.get("ts", 0)))
+        snippet = e.get("text", "").replace("\n", " ")
+        if len(snippet) > 70:
+            snippet = snippet[:70] + "…"
+        print(f"  {CYAN}{i:3d}{RESET} {DIM}{when}{RESET}  {snippet}")
+
+
+def cmd_replay(args=None) -> None:
+    """Re-speak a message from history: claude-voice replay [n] (1 = latest)."""
+    idx = 1
+    if args:
+        try:
+            idx = max(1, int(float(args[0])))
+        except ValueError:
+            print(f"  {RED}✗{RESET} usage: claude-voice replay [n]")
+            return
+    entries = _read_history()
+    if not entries:
+        print(f"  {DIM}no spoken messages yet{RESET}")
+        return
+    if idx > len(entries):
+        print(f"  {RED}✗{RESET} only {len(entries)} message(s) in history")
+        return
+    text = entries[idx - 1].get("text", "")
+    if not text.strip():
+        return
+
+    cfg = load_config()
+    if not _ensure_daemon():
+        try:
+            speak_and_highlight(text, tty_path=_resolve_tty())
+        except Exception:
+            pass
+        return
+    resp = _send_to_daemon({
+        "op": "speak",
+        "text": text,
+        "provider": cfg.get("provider", "kokoro"),
+        "tty_path": _resolve_tty(),
+        "override": True,
+    }, timeout=3.0)
+    if resp is None:
+        print(f"  {RED}✗{RESET} daemon unreachable")
+
+
+def cmd_seek(args=None) -> None:
+    """Jump within the last spoken message: claude-voice seek <seconds>."""
+    try:
+        pos = float(args[0])
+    except (IndexError, TypeError, ValueError):
+        print(f"  {RED}✗{RESET} usage: claude-voice seek <seconds>")
+        return
+    if not _daemon_alive():
+        print(f"  {DIM}nothing to seek (daemon not running){RESET}")
+        return
+    resp = _send_to_daemon({"op": "seek", "pos": pos}, timeout=2.0)
+    if resp and resp.get("error"):
+        print(f"  {DIM}{resp['error']}{RESET}")
+
+
+def cmd_playpause(args=None) -> None:
+    """Toggle pause/resume of the last spoken message."""
+    if not _daemon_alive():
+        print(f"  {DIM}nothing playing (daemon not running){RESET}")
+        return
+    resp = _send_to_daemon({"op": "playpause"}, timeout=2.0) or {}
+    if resp.get("error"):
+        print(f"  {DIM}{resp['error']}{RESET}")
+    else:
+        print(f"  {GREEN}✓{RESET} {'paused' if resp.get('paused') else 'playing'}")
+
+
+def cmd_playinfo(args=None) -> None:
+    """Print JSON playback position of the last spoken message (for the panel)."""
+    resp = _send_to_daemon({"op": "playinfo"}, timeout=1.0) if _daemon_alive() else None
+    print(json.dumps(resp or {"pos": 0, "duration": 0, "playing": False}))
 
 
 def cmd_stop(args=None) -> None:
@@ -2054,6 +2288,10 @@ def cmd_slash(args):
             cfg["theme"] = rest[0].lower()
             save_config(cfg)
             print(f"theme set to {cfg['theme']}")
+        elif action == "announce" and rest and rest[0].lower() in ("on", "off"):
+            cfg["announce_project"] = rest[0].lower() == "on"
+            save_config(cfg)
+            print(f"announce project set to {rest[0].lower()}")
         elif action == "voices":
             target = cfg.get("provider", "kokoro")
             names = {"kokoro": list(KOKORO_VOICES), "openai": list(OPENAI_VOICES),
@@ -2064,7 +2302,7 @@ def cmd_slash(args):
             print("providers: " + ", ".join(f"{p} ({PROVIDERS[p]['blurb']})" for p in PROVIDERS))
         else:
             print("usage: /voice [on|off|toggle|mute|unmute|status|provider <name>|voice <name>|"
-                  "speed <x>|volume <x>|theme <name>|voices|providers]")
+                  "speed <x>|volume <x>|theme <name>|announce on|off|voices|providers]")
     except (ProviderError, ValueError) as e:
         print(f"error: {e}")
 
@@ -2083,6 +2321,11 @@ COMMANDS = {
     "unclaim": cmd_unclaim,
     "clip": cmd_clip,
     "stop": cmd_stop,
+    "history": cmd_history,
+    "replay": cmd_replay,
+    "seek": cmd_seek,
+    "playpause": cmd_playpause,
+    "playinfo": cmd_playinfo,
     "daemon": cmd_daemon,
     "daemon-status": cmd_daemon_status,
     "daemon-stop": cmd_daemon_stop,
@@ -2094,6 +2337,7 @@ COMMANDS = {
     "speed": cmd_speed,
     "volume": cmd_volume,
     "theme": cmd_theme,
+    "announce": cmd_announce,
     "key": cmd_key,
     "demo": cmd_demo,
     "benchmark": cmd_benchmark,
@@ -2162,6 +2406,9 @@ def main():
         max_chars = cfg.get("max_chars", MAX_CHARS)
         if not args.long and len(text) > max_chars:
             text = text[:max_chars].rsplit(" ", 1)[0] + "..."
+        if cfg.get("announce_project", False):
+            project = os.path.basename(os.getcwd().rstrip("/")) or "root"
+            text = f"{project}. {text}"
 
     tty_path = _resolve_tty()
     use_daemon = cfg.get("use_daemon", True) and not args.no_daemon
