@@ -267,6 +267,22 @@ local cvBridge = hs.webview.usercontent.new("cv"):setCallback(function(msg)
     end
 end)
 
+-- Auto-refresh the open panel when a new message lands in the history file.
+local cvRefreshPending = nil
+local cvWatcher = hs.pathwatcher.new(os.getenv("HOME") .. "/.cache/claude-voice/",
+    function(files)
+        for _, f in ipairs(files) do
+            if f:find("history%.jsonl$") then
+                if cvRefreshPending then cvRefreshPending:stop() end
+                cvRefreshPending = hs.timer.doAfter(0.5, function()
+                    cvRefreshPending = nil
+                    if cvPanel and cvPanel:hswindow() then cvRefresh() end
+                end)
+                return
+            end
+        end
+    end):start()
+
 hs.hotkey.bind({ "cmd", "ctrl" }, "g", function()
     if cvPanel and cvPanel:hswindow() then
         if cvTimer then cvTimer:stop(); cvTimer = nil end
