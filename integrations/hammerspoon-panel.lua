@@ -36,7 +36,7 @@ local cvPanel = nil
 local cvTimer = nil
 local cvCompact = false
 local cvLastFullFrame = nil
-local FULL = { w = 360, h = 680 }
+local FULL = { w = 360, h = 920 }
 local MINI = { w = 300, h = 128 }
 
 local function cvRun(args, andThen)
@@ -108,32 +108,43 @@ local function cvParseOrchMsg(path)
 end
 
 local function cvReadOrchMessages(maxItems)
-    local paths = {}
-    cvWalkMd(ORCH_MSGS .. "/inbox", paths)
-    cvWalkMd(ORCH_MSGS .. "/archive", paths)
-    local seen = {}
-    for _, p in ipairs(paths) do
-        local m = cvParseOrchMsg(p)
-        if m then
-            local key = m.from .. "\0" .. m.to .. "\0" .. m.date .. "\0" .. m.re
-            local prev = seen[key]
-            if not prev or #m.body > #prev.body then
-                seen[key] = m
+    local ok, result = pcall(function()
+        local paths = {}
+        cvWalkMd(ORCH_MSGS .. "/inbox", paths)
+        cvWalkMd(ORCH_MSGS .. "/archive", paths)
+        local seen = {}
+        for _, p in ipairs(paths) do
+            local m = cvParseOrchMsg(p)
+            if m then
+                local key = m.from .. "\0" .. m.to .. "\0" .. m.date .. "\0" .. m.re
+                local prev = seen[key]
+                if not prev or #m.body > #prev.body then
+                    seen[key] = m
+                end
             end
         end
-    end
-    local items = {}
-    for _, m in pairs(seen) do items[#items + 1] = m end
-    table.sort(items, function(a, b) return a.sort > b.sort end)
-    local out = {}
-    for i = 1, math.min(maxItems, #items) do out[i] = items[i] end
-    return out
+        local items = {}
+        for _, m in pairs(seen) do items[#items + 1] = m end
+        table.sort(items, function(a, b) return a.sort > b.sort end)
+        local out = {}
+        for i = 1, math.min(maxItems, #items) do out[i] = items[i] end
+        return out
+    end)
+    if ok and type(result) == "table" then return result end
+    return {}
 end
 
 local function cvFullFrame()
     local sf = hs.screen.mainScreen():frame()
     if cvLastFullFrame then return cvLastFullFrame end
-    return { x = sf.x + sf.w - FULL.w - 20, y = sf.y + 40, w = FULL.w, h = FULL.h }
+    -- Stay on-screen: leave a little air above the Dock and below the menu bar.
+    local topGap, botGap = 28, 20
+    local h = math.min(FULL.h, sf.h - topGap - botGap)
+    local y = sf.y + topGap
+    if y + h > sf.y + sf.h - botGap then
+        y = sf.y + sf.h - botGap - h
+    end
+    return { x = sf.x + sf.w - FULL.w - 20, y = y, w = FULL.w, h = h }
 end
 
 local function cvMiniFrame()
@@ -340,7 +351,7 @@ local function cvBuildHtml()
       body {
         font: 13px/1.4 -apple-system, "SF Pro Text", sans-serif;
         color: rgba(235,238,250,0.92);
-        padding: 40px 14px 14px;
+        padding: 40px 14px 22px;
         user-select: none;
         background:
           radial-gradient(120% 90% at 15% 0%, rgba(122,162,255,0.16), transparent 55%),
@@ -352,7 +363,7 @@ local function cvBuildHtml()
         flex-direction: column;
       }
       .grow { flex: 1; display: flex; flex-direction: column;
-              min-height: 0; margin-bottom: 0; }
+              min-height: 0; margin-bottom: 0; overflow-y: auto; }
       .card {
         background: rgba(255,255,255,0.055);
         border: 1px solid rgba(255,255,255,0.10);
@@ -391,11 +402,11 @@ local function cvBuildHtml()
       h2 { font-size: 10.5px; font-weight: 600; color: rgba(235,238,250,0.4);
            text-transform: uppercase; letter-spacing: 1.2px; margin: 2px 2px 8px; }
       h2.sub { margin-top: 14px; }
-      .hist { flex: 1; min-height: 48px; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
+      .hist { flex: 1; min-height: 140px; overflow-y: auto; margin: 0 -4px; padding: 0 4px; }
       .hist::-webkit-scrollbar, .orch::-webkit-scrollbar { width: 5px; }
       .hist::-webkit-scrollbar-thumb, .orch::-webkit-scrollbar-thumb {
         background: rgba(255,255,255,0.15); border-radius: 3px; }
-      .orch { flex: 0 0 auto; margin: 0 -4px; padding: 0 4px; }
+      .orch { flex: 0 0 auto; margin: 0 -4px; padding: 0 4px 8px; }
       .orch .msg { padding: 6px 10px; margin-bottom: 4px; font-size: 12px; }
       .msg .route { font-weight: 600; overflow-wrap: anywhere; }
       .msg .sep { color: #8ab6ff; font-weight: 500; }
@@ -460,7 +471,7 @@ local function cvBuildHtml()
       .reader-body {
         flex: 1; min-height: 0; overflow-y: auto;
         padding: 14px 16px 18px;
-        font-size: 14.5px; line-height: 1.6;
+        font-size: 16px; line-height: 1.6;
         white-space: pre-wrap; overflow-wrap: anywhere;
         user-select: text; -webkit-user-select: text;
         color: rgba(235,238,250,0.94);
@@ -617,7 +628,7 @@ hs.hotkey.bind({ "cmd", "ctrl" }, "g", function()
     cvCompact = false
     cvLastFullFrame = nil
     cvPanel = hs.webview.new(cvFullFrame(), {}, cvBridge)
-        :windowStyle({ "titled", "closable", "utility", "fullSizeContentView" })
+        :windowStyle({ "titled", "closable", "resizable", "utility", "fullSizeContentView" })
         :windowTitle("claude-voice")
         :level(hs.drawing.windowLevels.floating)
         :allowTextEntry(true)
