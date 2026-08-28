@@ -10,11 +10,12 @@
 --     (headings, lists, tables rendered), with a Replay button
 --   * five most recent agent-to-agent messages (agent name, then the
 --     message). Click to read the whole note in the same formatted popup
---   * side column of every registered agent: Live (green = a Terminal
---     whose title shows `◂ claude`, i.e. an active cloud agent) on top,
---     Idle underneath. Click a name to bring that agent's Terminal
---     forward at a readable size — never a 33×5 thumbnail.
---   * "Arrange live" tiles every Terminal that currently has a cloud agent
+--   * side column of every registered agent: Live (green = Claude is
+--     still running in that Terminal) on top, Idle underneath. A window
+--     whose title still says claude after the process has exited is Idle.
+--     Click a name to bring that agent's Terminal forward at a readable
+--     size — never a 33×5 thumbnail.
+--   * "Arrange live" tiles every Terminal that currently has Claude running
 --   * "Make smaller" shrinks the panel to a compact card on the right edge
 --
 -- Requires claude-voice >= 0.2 with the history/replay/seek/playpause
@@ -324,12 +325,33 @@ local function cvResizeFocusedTerminal()
 end
 
 -- Terminal.app titles look like:
---   "iNotes — ✳ some task — node ◂ claude -c — 33×5"   (active cloud agent)
+--   "iNotes — ✳ some task — node ◂ claude -c — 33×5"   (Claude still running)
 --   "iNotes — -zsh — 128×30"                           (idle shell)
--- Live / green = the title contains "◂ claude". Click matches the folder
--- name at the start of the title, then enlarges that window so it is readable.
+-- Live / green = a process named "claude" is running in that Terminal.
+-- A leftover title after Claude has exited is Idle, not green.
+-- Click matches the folder name at the start of the title, then enlarges
+-- that window so it is readable.
 local cvTermByPath = {}
 local cvTermSig = ""
+local cvLiveTitles = {}
+
+-- AppleScript fragment: given window `w`, sets nm + isLive.
+-- isLive is true only while a process named "claude" is running.
+local function cvLiveClaudeSnippet()
+    return [[
+      set nm to name of w as text
+      set procClaude to false
+      repeat with tb in tabs of w
+        try
+          set procs to processes of tb
+          repeat with p in procs
+            if (p as text) is "claude" then set procClaude to true
+          end repeat
+        end try
+      end repeat
+      set isLive to procClaude
+    ]]
+end
 
 local function cvIndexRegistry()
     local byKey = {}
@@ -356,13 +378,13 @@ set out to ""
 tell application "Terminal"
   repeat with w in windows
     try
-      set nm to name of w as text
-      set cloud to "0"
-      if nm contains "◂ claude" then set cloud to "1"
+]] .. cvLiveClaudeSnippet() .. [[
+      set live to "0"
+      if isLive then set live to "1"
       set AppleScript's text item delimiters to " — "
       set prefix to text item 1 of nm
       set AppleScript's text item delimiters to ""
-      set out to out & cloud & "::" & prefix & linefeed
+      set out to out & live & tab & prefix & tab & nm & linefeed
     end try
   end repeat
 end tell
@@ -370,14 +392,17 @@ return out
 ]]
     local t = hs.task.new("/usr/bin/osascript", function(_, stdout)
         local byKey = cvIndexRegistry()
-        local byPath, sig = {}, {}
+        local byPath, sig, liveTitles = {}, {}, {}
         for line in (stdout or ""):gmatch("[^\n]+") do
-            local cloud, prefix = line:match("^([01])::(.*)$")
+            local live, prefix, title = line:match("^([01])\t(.-)\t(.*)$")
             if prefix and prefix ~= "" then
                 prefix = prefix:gsub("%s+$", "")
                 local rec = byKey[prefix]
                 local path = rec and rec.path or ("__win__/" .. prefix)
-                local isCloud = cloud == "1"
+                local isCloud = live == "1"
+                if isCloud and title and title ~= "" then
+                    liveTitles[title] = true
+                end
                 local prev = byPath[path]
                 if not prev or (isCloud and not prev.cloud) then
                     byPath[path] = {
@@ -387,7 +412,7 @@ return out
                         last_active = rec and rec.last_active or "",
                     }
                 end
-                sig[#sig + 1] = cloud .. prefix
+                sig[#sig + 1] = live .. prefix
             end
         end
         table.sort(sig)
@@ -395,14 +420,15 @@ return out
         local changed = s ~= cvTermSig
         cvTermSig = s
         cvTermByPath = byPath
+        cvLiveTitles = liveTitles
         if andThen then andThen(changed) end
     end)
     t:setInput(script)
     t:start()
 end
 
--- Live = Terminal title contains "◂ claude" (active cloud agent).
--- Idle = registered agent with no such window.
+-- Live = Claude is still running in that Terminal (busy tab).
+-- Idle = registered agent with no running Claude process.
 local function cvAgentLists()
     local ok, result = pcall(function()
         local byPath = {}
@@ -457,7 +483,7 @@ local function cvAgentButton(a)
         or '<span class="dot off" aria-hidden="true"></span>'
     local tip = a.path
     if a.live then
-        tip = a.name .. " — active cloud agent (click to open at full size)"
+        tip = a.name .. " — Claude is running (click to open at full size)"
     elseif a.last_active ~= "" then
         tip = a.name .. " — last active " .. a.last_active
     end
@@ -489,7 +515,7 @@ local function cvPrefixesFor(path)
 end
 
 -- Bring the matching Terminal window forward and enlarge it so the
--- conversation is readable. Prefers a window whose title contains "claude".
+-- conversation is readable. Prefers a window where Claude is still running.
 local function cvFocusTerminal(prefixes)
     local list = {}
     for _, p in ipairs(prefixes or {}) do list[#list + 1] = cvAsQuote(p) end
@@ -501,11 +527,11 @@ set anyWin to missing value
 tell application "Terminal"
   repeat with w in windows
     try
-      set nm to name of w as text
+]] .. cvLiveClaudeSnippet() .. [[
       repeat with p in prefs
         set pref to p as text
         if nm starts with (pref & " —") then
-          if nm contains "◂ claude" then
+          if isLive then
             set cloudWin to w
           else if anyWin is missing value then
             set anyWin to w
@@ -606,7 +632,7 @@ local function cvCloudTerminalWindows()
     if not app then return wins end
     for _, w in ipairs(app:allWindows()) do
         local t = w:title() or ""
-        if t:find("◂ claude", 1, true) then
+        if cvLiveTitles[t] then
             wins[#wins + 1] = w
         end
     end
@@ -1007,7 +1033,7 @@ local function cvBuildHtml()
     for _, a in ipairs(lists.live) do liveRows[#liveRows + 1] = cvAgentButton(a) end
     for _, a in ipairs(lists.idle) do idleRows[#idleRows + 1] = cvAgentButton(a) end
     if #liveRows == 0 then
-        liveRows = { '<div class="empty">none open</div>' }
+        liveRows = { '<div class="empty">none running</div>' }
     end
     if #idleRows == 0 then
         idleRows = { '<div class="empty">none</div>' }
@@ -1428,7 +1454,7 @@ local cvBridge = hs.webview.usercontent.new("cv"):setCallback(function(msg)
     elseif m.action == "playpause" then
         cvRun({ "playpause" })
     elseif m.action == "refresh" then
-        cvRefresh()
+        cvScanSessions(function() cvRefresh() end)
     elseif m.action == "shrink" then
         cvSetCompact(true)
     elseif m.action == "expand" then
@@ -1517,7 +1543,8 @@ hs.hotkey.bind({ "cmd", "ctrl" }, "g", function()
             return
         end
         tick = tick + 1
-        if tick % 5 == 0 then
+        -- Rescan Claude sessions so Live turns off soon after a process exits.
+        if tick % 2 == 0 then
             cvScanSessions(function(changed)
                 if changed then cvScheduleRefresh() end
             end)
