@@ -384,7 +384,9 @@ tell application "Terminal"
       set AppleScript's text item delimiters to " — "
       set prefix to text item 1 of nm
       set AppleScript's text item delimiters to ""
-      set out to out & live & tab & prefix & tab & nm & linefeed
+      -- Do not use AppleScript `tab` here: inside `tell Terminal` it means
+      -- a tab object, so the line becomes "1tabVAD..." and Lua cannot parse it.
+      set out to out & live & "::" & prefix & linefeed
     end try
   end repeat
 end tell
@@ -394,15 +396,12 @@ return out
         local byKey = cvIndexRegistry()
         local byPath, sig, liveTitles = {}, {}, {}
         for line in (stdout or ""):gmatch("[^\n]+") do
-            local live, prefix, title = line:match("^([01])\t(.-)\t(.*)$")
+            local live, prefix = line:match("^([01])::(.*)$")
             if prefix and prefix ~= "" then
                 prefix = prefix:gsub("%s+$", "")
                 local rec = byKey[prefix]
                 local path = rec and rec.path or ("__win__/" .. prefix)
                 local isCloud = live == "1"
-                if isCloud and title and title ~= "" then
-                    liveTitles[title] = true
-                end
                 local prev = byPath[path]
                 if not prev or (isCloud and not prev.cloud) then
                     byPath[path] = {
@@ -412,6 +411,7 @@ return out
                         last_active = rec and rec.last_active or "",
                     }
                 end
+                if isCloud then liveTitles[prefix] = true end
                 sig[#sig + 1] = live .. prefix
             end
         end
@@ -630,9 +630,15 @@ local function cvCloudTerminalWindows()
     local wins = {}
     local app = hs.application.get("Terminal")
     if not app then return wins end
+    local livePrefixes = {}
+    for _, term in pairs(cvTermByPath) do
+        if term.cloud and term.prefix then livePrefixes[term.prefix] = true end
+    end
+    for p, _ in pairs(cvLiveTitles) do livePrefixes[p] = true end
     for _, w in ipairs(app:allWindows()) do
         local t = w:title() or ""
-        if cvLiveTitles[t] then
+        local prefix = t:match("^(.-) —") or t
+        if livePrefixes[prefix] then
             wins[#wins + 1] = w
         end
     end
