@@ -86,6 +86,7 @@ SOCK_PATH = os.path.join(RUNTIME_DIR, "daemon.sock")
 PID_PATH = os.path.join(RUNTIME_DIR, "daemon.pid")
 LOG_PATH = os.path.join(RUNTIME_DIR, "daemon.log")
 HISTORY_PATH = os.path.join(RUNTIME_DIR, "history.jsonl")
+ORCH_REG_PATH = os.path.expanduser("~/.claude/orchestration/registry.json")
 DAEMON_IDLE_TIMEOUT = 1800            # seconds before idle daemon exits
 DAEMON_SPAWN_WAIT = 15                # max seconds to wait for cold-spawned daemon
 ACTIVE_TTY_STALE = 600                # claim auto-expires after 10 min
@@ -978,13 +979,67 @@ def mini_bar(current: int, total: int, width: int = 22) -> str:
 
 # ── core speak loop ──
 
-def _log_history(text: str, provider: str, voice: str) -> None:
-    """Append a spoken message to the history log (newest last)."""
+def _agent_label(cwd: str | None = None) -> str:
+    """Name of the orchestration agent for this folder, or the folder name.
+
+    Looks up ~/.claude/orchestration/registry.json so a project like
+    KHCC_Daily_Extractions shows up as dashboard_builder. Longest matching
+    path wins, so a nested folder does not steal the parent agent's name.
+    """
+    path = os.path.abspath(cwd or os.getcwd())
+    folder = os.path.basename(path.rstrip(os.sep)) or "root"
+    try:
+        with open(ORCH_REG_PATH) as f:
+            reg = json.load(f)
+        best, best_len = None, -1
+        for p, entry in reg.items():
+            if not isinstance(entry, dict):
+                continue
+            norm = os.path.abspath(os.path.expanduser(str(p)).rstrip(os.sep))
+            if path == norm or path.startswith(norm + os.sep):
+                if len(norm) > best_len:
+                    best = entry.get("name") or folder
+                    best_len = len(norm)
+        if best:
+            return str(best)
+    except (OSError, json.JSONDecodeError, TypeError, AttributeError):
+        pass
+    return folder
+
+
+def _history_agent_and_snippet(entry: dict) -> tuple[str, str]:
+    """Split a history row into (agent name, message) for display."""
+    text = (entry.get("text") or "").replace("\n", " ").strip()
+    agent = str(entry.get("agent") or "").strip()
+    if agent and text.startswith(agent + ". "):
+        return agent, text[len(agent) + 2:]
+    if not agent:
+        m = re.match(r"^([\w.-]+)\.\s+(.*)$", text)
+        if m:
+            return m.group(1), m.group(2)
+    return agent, text
+
+
+def _log_history(text: str, provider: str, voice: str,
+                 agent: str | None = None, display: str | None = None) -> None:
+    """Append a spoken message to the history log (newest last).
+
+    `text` is what was spoken (used for Replay). `display` is the original
+    markdown, so the panel can show tables and headings instead of the
+    flattened speech version. `agent` is the project that spoke.
+    """
     try:
         os.makedirs(RUNTIME_DIR, exist_ok=True)
+        rec = {"ts": time.time(), "text": text,
+               "provider": provider, "voice": voice}
+        if agent:
+            rec["agent"] = agent
+        if display and display.strip() and display.strip() != text.strip():
+            if len(display) > 50000:
+                display = display[:50000] + "\n\n…"
+            rec["display"] = display
         with open(HISTORY_PATH, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "text": text,
-                                "provider": provider, "voice": voice}) + "\n")
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
         # keep the file from growing forever
         with open(HISTORY_PATH) as f:
             lines = f.readlines()
@@ -1012,7 +1067,8 @@ def _read_history() -> list[dict]:
 
 
 def speak_and_highlight(text: str, provider: str | None = None, voice: str | None = None,
-                        show_stats: bool = False, tty_path: str = "/dev/tty") -> dict:
+                        show_stats: bool = False, tty_path: str = "/dev/tty",
+                        agent: str | None = None, display: str | None = None) -> dict:
     global _interrupted, _play_audio, _play_rate, _play_duration, \
         _play_offset, _play_t0, _play_paused
     cfg = load_config()
@@ -1042,7 +1098,7 @@ def speak_and_highlight(text: str, provider: str | None = None, voice: str | Non
         return {}
     spinner.stop()
 
-    _log_history(text, provider, voice)
+    _log_history(text, provider, voice, agent=agent, display=display)
 
     gen_time = time.monotonic() - t0
     audio_duration = len(audio) / rate
@@ -1428,6 +1484,8 @@ def _handle_client(conn: socket.socket) -> None:
         voice = req.get("voice") or current_voice(cfg, provider)
         tty_path = req.get("tty_path") or "/dev/tty"
         override = bool(req.get("override"))
+        agent = req.get("agent") or None
+        display = req.get("display") or None
 
         if not text.strip():
             conn.sendall(json.dumps({"error": "empty"}).encode() + b"\n")
@@ -1466,7 +1524,8 @@ def _handle_client(conn: socket.socket) -> None:
         with _playback_lock:
             _interrupted = False
             try:
-                speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path)
+                speak_and_highlight(text, provider=provider, voice=voice,
+                                    tty_path=tty_path, agent=agent, display=display)
             except Exception as e:
                 # The audio output device (e.g. Bluetooth headphones) likely
                 # changed under us — PortAudio holds a stale handle to it.
@@ -1477,7 +1536,8 @@ def _handle_client(conn: socket.socket) -> None:
                         sd._terminate()
                         sd._initialize()
                     _interrupted = False
-                    speak_and_highlight(text, provider=provider, voice=voice, tty_path=tty_path)
+                    speak_and_highlight(text, provider=provider, voice=voice,
+                                        tty_path=tty_path, agent=agent, display=display)
                 except Exception as e2:
                     _daemon_log(f"retry failed: {e2}")
     except (json.JSONDecodeError, OSError, ValueError) as e:
@@ -2030,10 +2090,11 @@ def cmd_history(args=None) -> None:
             pass
     for i, e in enumerate(entries[:n], 1):
         when = time.strftime("%H:%M", time.localtime(e.get("ts", 0)))
-        snippet = e.get("text", "").replace("\n", " ")
+        agent, snippet = _history_agent_and_snippet(e)
         if len(snippet) > 70:
             snippet = snippet[:70] + "…"
-        print(f"  {CYAN}{i:3d}{RESET} {DIM}{when}{RESET}  {snippet}")
+        who = f"{CYAN}{agent}{RESET}  " if agent else ""
+        print(f"  {CYAN}{i:3d}{RESET} {DIM}{when}{RESET}  {who}{snippet}")
 
 
 def cmd_replay(args=None) -> None:
@@ -2382,6 +2443,7 @@ def main():
 
     text = None
     hook_mode = False
+    original = None
     if args.text:
         text = " ".join(args.text)
     elif not sys.stdin.isatty():
@@ -2389,7 +2451,8 @@ def main():
         if not cfg.get("enabled", True):
             sys.exit(0)
         raw = sys.stdin.read().strip()
-        text = extract_hook_text(raw)
+        original = extract_hook_text(raw)
+        text = original
         if text and is_mostly_code(text):
             sys.exit(0)
 
@@ -2400,6 +2463,7 @@ def main():
     if not text:
         sys.exit(0)
 
+    agent = _agent_label()
     if hook_mode:
         if len(text) < cfg.get("min_chars", MIN_CHARS):
             sys.exit(0)
@@ -2407,8 +2471,7 @@ def main():
         if not args.long and len(text) > max_chars:
             text = text[:max_chars].rsplit(" ", 1)[0] + "..."
         if cfg.get("announce_project", False):
-            project = os.path.basename(os.getcwd().rstrip("/")) or "root"
-            text = f"{project}. {text}"
+            text = f"{agent}. {text}"
 
     tty_path = _resolve_tty()
     use_daemon = cfg.get("use_daemon", True) and not args.no_daemon
@@ -2420,6 +2483,8 @@ def main():
             "provider": provider or cfg.get("provider", "kokoro"),
             "voice": args.voice,
             "tty_path": tty_path,
+            "agent": agent,
+            "display": original,
         }, timeout=5.0)
         # "queued" → the daemon is speaking; "skipped" → it deliberately
         # declined (muted / another terminal owns the voice). Either way,
@@ -2429,7 +2494,8 @@ def main():
         # Daemon reachable but request errored — fall through to in-process.
 
     try:
-        speak_and_highlight(text, provider=provider, voice=args.voice, tty_path=tty_path)
+        speak_and_highlight(text, provider=provider, voice=args.voice,
+                            tty_path=tty_path, agent=agent, display=original)
     except Exception as e:
         if _tty:
             _tty.write(SHOW_CURSOR)
