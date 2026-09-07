@@ -62,7 +62,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 try:
     import numpy as np
     import sounddevice as sd
-except ImportError:
+except (ImportError, OSError):
+    # sounddevice raises OSError (not ImportError) when the Python package
+    # is installed but the PortAudio system library is missing.
     np = None
     sd = None
 
@@ -289,6 +291,18 @@ def _require_audio():
 
 # ── config ──
 
+def _harden_history_storage() -> None:
+    """Make the spoken-history folder and file private (only this user)."""
+    try:
+        if os.path.isdir(RUNTIME_DIR):
+            os.chmod(RUNTIME_DIR, 0o700)
+        if os.path.exists(HISTORY_PATH):
+            os.chmod(HISTORY_PATH, 0o600)
+    except OSError:
+        # A later history read/write will show a real error if needed.
+        pass
+
+
 def default_config() -> dict:
     return {
         "enabled": True,
@@ -323,6 +337,7 @@ def load_config() -> dict:
     global _config
     if _config is not None:
         return _config
+    _harden_history_storage()
     cfg = default_config()
     if os.path.exists(CONFIG_PATH):
         try:
@@ -1029,7 +1044,8 @@ def _log_history(text: str, provider: str, voice: str,
     flattened speech version. `agent` is the project that spoke.
     """
     try:
-        os.makedirs(RUNTIME_DIR, exist_ok=True)
+        os.makedirs(RUNTIME_DIR, mode=0o700, exist_ok=True)
+        os.chmod(RUNTIME_DIR, 0o700)
         rec = {"ts": time.time(), "text": text,
                "provider": provider, "voice": voice}
         if agent:
@@ -1040,12 +1056,14 @@ def _log_history(text: str, provider: str, voice: str,
             rec["display"] = display
         with open(HISTORY_PATH, "a") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        os.chmod(HISTORY_PATH, 0o600)
         # keep the file from growing forever
         with open(HISTORY_PATH) as f:
             lines = f.readlines()
         if len(lines) > 400:
             with open(HISTORY_PATH, "w") as f:
                 f.writelines(lines[-200:])
+            os.chmod(HISTORY_PATH, 0o600)
     except OSError:
         pass
 
