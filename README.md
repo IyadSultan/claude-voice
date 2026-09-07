@@ -1,71 +1,94 @@
-# claude-voice 🜏
+# claude-voice
 
-> The other half of Claude Code's voice mode.
+**Spoken replies for Claude Code — and a live operations panel for every agent on the machine.**
 
-You talk to Claude with `/voice`. Now Claude talks back — with real-time karaoke word highlighting in your terminal. Local by default, cloud voices (OpenAI, ElevenLabs, xAI Grok) when you want them.
+[![License: MIT](https://img.shields.io/badge/license-MIT-0b1220)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB)](https://www.python.org)
+[![macOS](https://img.shields.io/badge/panel-macOS-111111)](integrations/hammerspoon-panel.lua)
 
-![claude-voice demo](demo.gif)
+When a Claude session finishes a reply, claude-voice speaks it and highlights each word in the Terminal. A floating panel then shows every running agent, the last thing each one said, and one-click access to that Terminal.
 
----
+<p align="center">
+  <img src="static/image.png" alt="claude-voice Arrange live panel: agent cards on the left, voice controls and history on the right" width="1180">
+</p>
 
-## Table of Contents
+<p align="center"><em>Arrange live — one card per running Claude. Open the Terminal, replay the last note, or close the session. The column on the right is always available: speech controls, History, Messages, Live.</em></p>
 
-- [Why I Built This](#why-i-built-this)
-- [What It Does](#what-it-does)
-- [Install](#install)
-- [Providers](#providers)
-- [The /voice slash command](#the-voice-slash-command)
-- [Commands](#commands)
-- [Voices](#voices)
-- [Config](#config)
-- [How It Works](#how-it-works)
-- [Daemon mode](#daemon-mode)
-- [Multi-terminal routing](#multi-terminal-routing)
-- [Highlight-and-speak hotkey](#highlight-and-speak-hotkey)
-- [Current Pain Points](#current-pain-points)
-- [End Goals](#end-goals--where-this-is-headed)
-- [Requirements](#requirements)
-- [License](#license)
+Toggle the panel with **⌘⌃G**.
 
 ---
 
-## Why I Built This
+## Why it exists
 
-Claude Code has `/voice` — you speak, it transcribes, Claude responds in text. But Claude never talks back. I'm staring at a terminal reading a 3-paragraph explanation when I could be *hearing* it while I keep working.
+Claude Code already accepts voice. It does not speak back, and it does not show dozens of parallel sessions as a single picture.
 
-What I wanted: after every Claude response, automatically speak it aloud with word-by-word highlighting so I can follow along. Local. Free. Instant. No "would you like me to read this?" — just do it.
-
-So I built a Claude Code **Stop hook**. After every response, the hook fires, strips markdown/code/URLs, generates audio, and renders karaoke-style highlighting to the terminal while it plays. Local Kokoro TTS (82M params, CPU) by default — and since v0.2, cloud providers when you want a nicer voice: OpenAI, ElevenLabs, xAI Grok, or any OpenAI-compatible endpoint.
+This project does both: local-first speech after every Stop hook, and an operations view over the agents that are actually running.
 
 ---
 
-## What It Does
+## Architecture
 
-- **Karaoke highlighting** — current word lit up, gradient around it, progress bar with %, word count and elapsed/total time
-- **6 TTS providers** — local Kokoro (free, private), system voice, OpenAI, ElevenLabs, xAI Grok, or any OpenAI-compatible endpoint
-- **True word sync on ElevenLabs** — uses their timestamps API for real word-level alignment, not estimation
-- **`/voice` slash command** — control everything from inside Claude Code: `/voice off`, `/voice provider elevenlabs`, `/voice speed 1.2`
-- **Background daemon** — the model loads once and stays in memory. Warm TTFA drops from ~6s to ~0.6s
-- **Multi-terminal routing** — run Claude Code in five terminals at once and only the one you typed in speaks
-- **Per-terminal mute** — `claude-voice mute` silences the current terminal only
-- **Highlight-and-speak hotkey** — select any text in any app, press a key, and the daemon reads it back (Hammerspoon snippet included)
-- **Smart filtering** — skips code-heavy responses, strips markdown/URLs/tables, fixes dev pronunciations for local engines
-- **Interrupt on keypress** — press any key to stop immediately
-- **Themes** — aurora, ember, violet, mint, mono
-- **One-command setup** — `claude-voice setup` installs the hooks and the slash command
+```mermaid
+flowchart LR
+    U[Operator] -->|prompt| C[Claude Code]
+    C -->|Stop hook| H[Speakable text]
+    H --> D[Warm daemon]
+    D -->|karaoke playback| T[Terminal]
+    D -->|private log| Hist[History]
+    T --> P[Control panel]
+    Hist --> P
+    R[Agent registry] --> P
+    M[Agent messages] --> P
+    P -->|⌘⌃G · Open · Replay| U
+```
+
+Speech stays in-process on this Mac unless you choose a cloud voice. History is written only for this user (`~/.cache/claude-voice/history.jsonl`, mode `600`).
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant Claude
+    participant Hook
+    participant Daemon
+    participant Panel
+
+    You->>Claude: Send prompt
+    Claude->>Hook: Reply complete
+    Hook->>Daemon: Cleaned text
+    Daemon->>You: Spoken reply + word highlight
+    Daemon->>Panel: History row
+    You->>Panel: Click message or agent card
+    Panel->>You: Read · Replay · Open Terminal
+```
+
+---
+
+## Capabilities
+
+| Speech | Operations |
+|---|---|
+| Karaoke highlighting in the calling Terminal | Arrange live card grid (A–Z, running agents only) |
+| Six providers: Kokoro, system, OpenAI, ElevenLabs, Grok, custom | Live / Idle roster with Open on click |
+| Warm daemon (~0.6s to first audio after load) | History and agent-to-agent Messages |
+| Only the Terminal you just typed in speaks | Replay, Previous, Next, Open, Close on a clicked note |
+| `/voice` from inside Claude Code | Save / restore session snapshots; Close all |
+
+Green **Working** (or a green Live dot) means a `claude` process is still running in that folder. Open reuses an existing Terminal of that name. Close types `exit` in that session only.
 
 ---
 
 ## Install
 
 ```bash
-git clone https://github.com/Null-Phnix/claude-voice
+git clone https://github.com/IyadSultan/claude-voice
 cd claude-voice
-python3 -m venv .venv && .venv/bin/pip install -e ".[local]"   # [local] = Kokoro TTS
+python3 -m venv .venv && .venv/bin/pip install -e ".[local]"
 .venv/bin/claude-voice setup
 ```
 
-Cloud-only (no local model, tiny install): drop `[local]` and pick a provider:
+Restart Claude Code. Replies are spoken automatically. Confirm with `/voice status`.
+
+Cloud-only (no local model):
 
 ```bash
 .venv/bin/pip install -e .
@@ -73,194 +96,89 @@ Cloud-only (no local model, tiny install): drop `[local]` and pick a provider:
 .venv/bin/claude-voice key openai sk-...
 ```
 
-Restart Claude Code and every response will be spoken. Try `/voice status` inside Claude Code.
+### macOS panel
+
+```bash
+brew install --cask hammerspoon
+```
+
+Grant Accessibility under **System Settings → Privacy & Security**. Add this line to `~/.hammerspoon/init.lua`:
+
+```lua
+dofile(os.getenv("HOME") .. "/code/claude-voice/integrations/hammerspoon-panel.lua")
+```
+
+Reload Hammerspoon, then press **⌘⌃G**. Point `CLAUDE_VOICE_BIN` at your install if it is not `~/.local/bin/claude-voice`.
+
+---
+
+## Panel reference
+
+| Control | Action |
+|---|---|
+| On / Off | Speech for every Terminal |
+| Stop / pause / seek | Current utterance |
+| Speed · Volume · Voice | Follows the active theme |
+| Arrange live | Card grid beside the panel |
+| Show messages | Who wrote to whom; click an edge to read |
+| Save / Clock | Snapshot running Terminals; restore after reboot |
+| Close all | Exit every live Claude, then close those windows (confirm first) |
+| History | Spoken replies — read, replay, or open the agent |
+| Messages | Latest agent-to-agent notes |
+| Live / Idle | Full roster; click a name to focus that Terminal |
 
 ---
 
 ## Providers
 
-| Provider | What it is | Key | Karaoke sync |
+| Provider | Role | Key | Word sync |
 |---|---|---|---|
-| `kokoro` (default) | Local Kokoro 82M — free, private, runs on CPU | none | estimated |
-| `system` | Your OS voice (macOS `say` / espeak) — zero install | none | estimated |
-| `openai` | OpenAI TTS (`gpt-4o-mini-tts`) | `OPENAI_API_KEY` | estimated |
-| `elevenlabs` | ElevenLabs | `ELEVENLABS_API_KEY` | **true timestamps** |
-| `grok` | xAI Grok TTS (`api.x.ai/v1/tts`) | `XAI_API_KEY` | estimated |
-| `custom` | Any OpenAI-compatible `/audio/speech` endpoint (Groq, LocalAI, ...) | optional | estimated |
-
-Switch any time: `claude-voice provider elevenlabs` or `/voice provider elevenlabs` inside Claude Code. Keys come from env vars or `claude-voice key <provider> <key>` (stored in the config file, chmod 600). Each provider remembers its own voice.
-
-For `custom`, set the endpoint in `~/.config/claude-voice/config.json`:
-
-```json
-"custom": {"base_url": "https://api.groq.com/openai/v1", "model": "playai-tts"}
-```
-
-Cloud providers that return MP3 need `ffmpeg` on PATH (`brew install ffmpeg`).
-
----
-
-## The /voice slash command
-
-`claude-voice setup` installs `~/.claude/commands/voice.md`, so inside Claude Code you can type:
-
-```
-/voice off                 turn speech off globally
-/voice on                  back on
-/voice mute                mute just this terminal
-/voice status              current state
-/voice provider grok       switch provider
-/voice voice eve           switch voice
-/voice speed 1.3           faster
-/voice theme violet        restyle the karaoke UI
-/voice voices              list voices for the current provider
-```
-
-The command runs instantly (it executes before the prompt is sent) and Claude just relays the result.
-
----
-
-## Commands
+| `kokoro` (default) | Local 82M model, CPU, private | — | estimated |
+| `system` | macOS `say` / espeak | — | estimated |
+| `openai` | `gpt-4o-mini-tts` | `OPENAI_API_KEY` | estimated |
+| `elevenlabs` | Hosted TTS | `ELEVENLABS_API_KEY` | character timestamps |
+| `grok` | xAI TTS | `XAI_API_KEY` | estimated |
+| `custom` | Any OpenAI-compatible `/audio/speech` | optional | estimated |
 
 ```bash
-claude-voice setup              # install Stop + UserPromptSubmit hooks + /voice command
-claude-voice uninstall          # remove all of it
-claude-voice on | off | toggle  # enable / disable globally
-claude-voice mute | unmute      # this terminal only
-claude-voice status             # current state at a glance
-claude-voice provider <name>    # switch TTS provider (no arg: list)
-claude-voice voice <name>       # set voice for current provider
-claude-voice voices [provider]  # list voices
-claude-voice key <prov> <key>   # store an API key (no args: show key status)
-claude-voice speed 1.2          # playback speed
-claude-voice volume 80%         # volume
-claude-voice theme ember        # UI theme
-claude-voice clip               # speak the clipboard (bind to a hotkey)
-claude-voice daemon-status      # warm-daemon state
-claude-voice daemon-stop        # stop the daemon
-claude-voice demo               # polished demo (for screen recording)
-claude-voice benchmark          # latency stats
-claude-voice doctor             # diagnose broken installs
-claude-voice "some text"        # speak arbitrary text
-claude-voice -p openai -v nova "text"   # one-off provider/voice
-claude-voice --no-daemon "text" # bypass the daemon; speak in-process
+claude-voice provider elevenlabs
+claude-voice key elevenlabs <key>
 ```
 
----
-
-## Voices
-
-- **kokoro** — 12 voices: `af_heart` (default), `af_nova`, `am_adam`, `am_fenrir`, `bm_george`, `bf_emma`, ... (`claude-voice voices kokoro`)
-- **openai** — `marin` (default), `cedar`, `nova`, `onyx`, `shimmer`, `coral`, `fable`, ...
-- **elevenlabs** — `Rachel` (default), `Adam`, `Josh`, `Domi`, ... plus every voice on your account (fetched live), or any raw voice ID
-- **grok** — `eve` (default), `ara`, `leo`, `rex`, `sal`, or any voice_id from docs.x.ai
-- **system** — whatever your OS ships (`claude-voice voices system`)
+MP3 voices need `ffmpeg` (`brew install ffmpeg`).
 
 ---
 
-## Config
+## Command line
 
-`~/.config/claude-voice/config.json`:
-
-```json
-{
-  "enabled": true,
-  "provider": "kokoro",
-  "voices": {"kokoro": "af_heart", "openai": "marin", "elevenlabs": "rachel", "grok": "eve"},
-  "speed": 1.0,
-  "volume": 1.0,
-  "theme": "aurora",
-  "chime": true,
-  "use_daemon": true,
-  "min_chars": 30,
-  "max_chars": 1500,
-  "keys": {}
-}
+```
+/voice on|off|mute|status|provider <name>|voice <name>|speed <x>|theme <name>
 ```
 
----
+```bash
+claude-voice setup | uninstall | on | off | toggle | mute | unmute | status
+claude-voice provider <name> | voice <name> | voices | key <prov> <key>
+claude-voice speed 1.2 | volume 80% | theme aurora
+claude-voice history | replay [n] | seek <sec> | playpause | clip | stop
+claude-voice daemon-status | daemon-stop | doctor | demo
+```
 
-## How It Works
-
-1. Claude Code fires the **Stop hook** after every response
-2. Hook reads the response text from stdin JSON (`last_assistant_message`, with a fallback that parses `transcript_path` on newer Claude Code versions)
-3. Strips markdown, code blocks, URLs, tables — keeps only speakable text; skips responses that are mostly code
-4. The hook hands the text to the **daemon** (spawning it if needed), which synthesizes with the active provider
-5. Audio plays while word-by-word highlighting renders to the calling terminal's tty — ElevenLabs uses real character timestamps, everything else uses length-weighted estimation
-6. Any keypress interrupts instantly; display cleans up after itself
-
----
-
-## Daemon mode
-
-Loading Kokoro takes ~6–10s, and the Stop hook fires a fresh Python process for every response. The daemon loads the model once and accepts requests over a Unix socket (`~/.cache/claude-voice/daemon.sock`), so warm TTFA drops to ~0.6s. It exits after 30 minutes idle and respawns on the next speak. Cloud providers go through it too — the hook client returns in ~50ms instead of blocking.
-
-`claude-voice daemon-status`, `claude-voice daemon-stop`, or set `"use_daemon": false` in config to opt out.
-
----
-
-## Multi-terminal routing
-
-Run Claude Code in five terminals and only the one you're typing in speaks:
-
-- A **UserPromptSubmit hook** claims the current terminal every time you send a prompt
-- When a response finishes, the daemon only speaks if it finishes in the claimed terminal (claims expire after 10 minutes)
-- `claude-voice mute` / `unmute` (or `/voice mute`) silences one terminal permanently without touching the others
-
----
-
-## Hotkeys
-
-[`integrations/raycast/`](integrations/raycast/) ships three Raycast script commands:
-
-| Command | What it does | Suggested hotkey |
-|---|---|---|
-| Voice On/Off | toggle speech globally | ⌘⌃T |
-| Voice Stop Speaking | interrupt current playback (`claude-voice stop`) | ⌘⌃S |
-| Voice Speak Clipboard | read the clipboard aloud (`claude-voice clip`) | ⌘⌃C |
-
-Setup: Raycast → Settings → Extensions → **+** → *Add Script Directory* → pick `integrations/raycast/`, then record a hotkey on each command. ⌘⌃ combos are chosen to stay clear of terminal multiplexers (tmux/herdr use plain ctrl/alt) and standard macOS shortcuts.
-
-Prefer Hammerspoon? [`integrations/hammerspoon-snippet.lua`](integrations/hammerspoon-snippet.lua) binds highlight-and-speak (select text in any app, press the key, hear it via `claude-voice clip`).
-
----
-
-## Current Pain Points
-
-1. **It's one file and it's getting big** — `claude_voice.py` now handles six providers, a daemon, routing, rendering, and the CLI. Still "one file" by design, but it's pushing it.
-2. **Code-heavy responses get skipped** — If a response is >50% inside code fences, the hook skips it. Correct, but the heuristic is crude and sometimes skips useful explanations that include code examples.
-3. **Estimated karaoke timing on most providers** — Only ElevenLabs returns real word timestamps. Kokoro/OpenAI/Grok timing is length-weighted estimation; good, not perfect.
-4. **Grok output format is undocumented** — xAI's TTS docs don't specify the audio container, so we sniff it (WAV natively, anything else via ffmpeg). Works, but it's a guess until they document it.
-5. **Terminal compatibility** — Works on Kitty, Ghostty, Alacritty, iTerm2. Windows Terminal? Probably not.
-
----
-
-## End Goals — Where This Is Headed
-
-### Short Term
-- **Better code detection** — distinguish "explanation with code examples" from "pure code response"
-- **Streaming synthesis** — start speaking sentence 1 while sentence 2 is still generating (biggest remaining TTFA win)
-
-### Medium Term
-- **Integration with agent ecosystem** — when Deep Video Watcher generates a comprehension report, claude-voice can read it aloud; when Blackreach finishes research, it can narrate findings
-- **Voice profiles per project** — coding voice (fast, clear) vs reading voice (warm, expressive) vs research voice (neutral, precise)
-- **Pause/resume across sessions** — interrupt a long narration, come back later and resume from where you left off
-
-### Long Term
-- **Real-time conversation** — full duplex: I speak, Claude thinks, Claude speaks back, I interrupt, Claude adapts. True voice mode.
-- **Integration with Claud-Ear** — when the music analysis tool runs, claude-voice narrates the results with the right musical terminology pronunciation
+Config: `~/.config/claude-voice/config.json` (mode `600` when keys are stored).
 
 ---
 
 ## Requirements
 
-- Python 3.11+ (3.12 recommended for Kokoro/torch)
-- `sounddevice`, `numpy` — plus `kokoro` for the local voice
-- `ffmpeg` for cloud providers that return MP3
-- macOS or Linux, any terminal with ANSI true color (Kitty, Ghostty, Alacritty, iTerm2, ...)
+- Python 3.11+ (3.12 recommended for Kokoro)
+- `sounddevice`, `numpy`; `kokoro` for the local voice
+- `ffmpeg` for MP3 cloud voices
+- macOS + Hammerspoon for the panel
+- A true-color terminal (Terminal.app, iTerm2, Kitty, Ghostty, Alacritty)
+
+If PortAudio is missing, the CLI stays up and reports that audio is unavailable.
 
 ---
 
 ## License
 
-MIT
+MIT. Speech core originated with [Null-Phnix/claude-voice](https://github.com/Null-Phnix/claude-voice). This repository adds the live-agent panel, history navigation, and session controls.
